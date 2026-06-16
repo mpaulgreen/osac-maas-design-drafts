@@ -1,0 +1,50 @@
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSSubscription
+metadata:
+  name: free-subscription
+  namespace: models-as-a-service
+spec:
+  owner:
+    groups:
+    - name: tier-free-users
+  modelRefs:
+  - name: facebook-opt-125m-simulated
+    namespace: llm
+    tokenRateLimits:
+    - limit: 100
+      window: 1m
+  priority: 0
+---
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSSubscription
+metadata:
+  name: premium-subscription
+  namespace: models-as-a-service
+spec:
+  owner:
+    groups:
+    - name: tier-premium-users
+  modelRefs:
+  - name: facebook-opt-125m-simulated
+    namespace: llm
+    tokenRateLimits:
+    - limit: 50000
+      window: 1m
+  priority: 1
+---
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSSubscription
+metadata:
+  name: enterprise-subscription
+  namespace: models-as-a-service
+spec:
+  owner:
+    groups:
+    - name: tier-enterprise-users
+  modelRefs:
+  - name: facebook-opt-125m-simulated
+    namespace: llm
+    tokenRateLimits:
+    - limit: 100000
+      window: 1m
+  priority: 2
