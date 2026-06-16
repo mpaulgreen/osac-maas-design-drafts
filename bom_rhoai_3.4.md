@@ -320,7 +320,11 @@ Expected: GPU count > 0, no pods in non-Ready state.
 
 ```shell
 # Check if already installed
-oc get csv -A | grep cert-manager && echo "Already installed — skip this step"
+if oc get csv -A 2>/dev/null | grep -q cert-manager; then
+  echo "Already installed -- skip this step"
+else
+  echo "Not installed -- proceeding with install"
+fi
 
 # Install if not present
 oc apply -f - <<'EOF'
@@ -607,14 +611,17 @@ oc wait --for=condition=CatalogSourcesUnhealthy=False subscription/rhods-operato
 >
 > Additionally, RHOAI may auto-create a SM subscription on the `stable` channel. If it does, **delete it** — SM 3.2.5 is already installed from step 2.2.
 
+Check the SM subscription channel:
 ```shell
-# Check if RHOAI created a conflicting SM subscription
-RHOAI_SM_SUB=$(oc get sub servicemeshoperator3 -n openshift-operators -o jsonpath='{.spec.channel}' 2>/dev/null)
-if [ "$RHOAI_SM_SUB" = "stable" ]; then
-  echo "WARNING: SM subscription changed to 'stable' channel — recreating on stable-3.2"
-  oc delete sub servicemeshoperator3 -n openshift-operators
-  # Re-create on stable-3.2 (same as step 2.2)
-  oc apply -f - <<'EOF'
+oc get sub servicemeshoperator3 -n openshift-operators -o jsonpath='{.spec.channel}' && echo ""
+# If "stable" — run the fix below. If "stable-3.2" — skip.
+```
+
+If the channel was changed to `stable`, delete and recreate on `stable-3.2`:
+```shell
+oc delete sub servicemeshoperator3 -n openshift-operators
+
+oc apply -f - <<'EOF'
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
@@ -628,9 +635,6 @@ spec:
   sourceNamespace: openshift-marketplace
   startingCSV: servicemeshoperator3.v3.2.5
 EOF
-else
-  echo "OK: SM subscription is on '${RHOAI_SM_SUB}' channel (not overwritten by RHOAI)"
-fi
 ```
 
 Verify:
@@ -745,7 +749,7 @@ oc api-resources --api-group=maas.opendatahub.io --no-headers 2>/dev/null
 # Expected: MaaSModelRef, MaaSSubscription, MaaSAuthPolicy, Tenant, AITenant, etc.
 
 echo "=== 10. RHCL / Kuadrant CRDs ==="
-oc get crd | grep -E 'authpolicies|ratelimitpolicies|tokenratelimitpolicies' --no-headers
+oc get crd --no-headers | grep -E 'authpolicies|ratelimitpolicies|tokenratelimitpolicies'
 # Expected: AuthPolicy, RateLimitPolicy, TokenRateLimitPolicy
 
 echo "=== 11. RHCL Version Pinning (critical) ==="
