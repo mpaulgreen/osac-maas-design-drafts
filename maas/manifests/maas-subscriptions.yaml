@@ -6,7 +6,7 @@ metadata:
 spec:
   owner:
     groups:
-    - name: tier-free-users
+    - name: system:serviceaccounts:maas-free
   modelRefs:
   - name: facebook-opt-125m-simulated
     namespace: llm
@@ -23,7 +23,7 @@ metadata:
 spec:
   owner:
     groups:
-    - name: tier-premium-users
+    - name: system:serviceaccounts:maas-premium
   modelRefs:
   - name: facebook-opt-125m-simulated
     namespace: llm
@@ -40,7 +40,7 @@ metadata:
 spec:
   owner:
     groups:
-    - name: tier-enterprise-users
+    - name: system:serviceaccounts:maas-enterprise
   modelRefs:
   - name: facebook-opt-125m-simulated
     namespace: llm

@@ -1,12 +1,33 @@
-# MaaS on RHOAI 3.4 with Keycloak SSO
+# MaaS on RHOAI 3.4 with OpenShift Token Auth
 
-*Deploy Models-as-a-Service (GA) on RHOAI 3.4 with Keycloak as the OIDC identity provider for authentication, tier-based token rate limiting, and API key management.*
+*Deploy Models-as-a-Service (GA) on RHOAI 3.4 using OpenShift tokens (K8s TokenReview) for authentication — no external IdP required. Includes tier-based token rate limiting and API key management.*
+
+> ### Auth Enforcement Does Not Work with RHCL 1.4.0 + SM 3.3.x
+>
+> **Tested June 16, 2026 on OCP 4.19.17 with RHCL 1.4.0 + SM 3.3.4.** All auth enforcement fails with this version combination. The root cause is auth-method-agnostic — it breaks at the Wasm shim layer before any identity provider is consulted.
+>
+> **What happens:**
+> - Unauthenticated inference returns **HTTP 200** (should be 401)
+> - API key creation returns **HTTP 500 AUTH_FAILURE** (should be 201)
+>
+> **Root cause:** RHCL 1.4.0's Kuadrant operator creates a Wasm EnvoyFilter with `allow_on_headers_stop_iteration: true` — a field in Envoy's `PluginConfig` proto that controls whether the Wasm plugin can return `StopIteration` from `on_http_request_headers`. The Kuadrant Wasm shim requires this to pause request processing while it dispatches an async gRPC call to Authorino and waits for the auth response. **Neither SM 3.2 (Istio 1.26) nor SM 3.3 (Istio 1.27) supports this field** — their Envoy binaries predate the proto version that introduced it. Without `StopIteration`, Envoy ignores the pause and immediately forwards the request to the backend. The auth response from Authorino arrives too late — the request has already been forwarded without `X-MaaS-Username` / `X-MaaS-Group` headers, causing maas-api to return `AUTH_FAILURE`.
+>
+> **Evidence from live cluster diagnostics:**
+> - `kuadrant.hits` increments (Wasm shim matches action sets) but `kuadrant.denied` is always 0
+> - `kuadrant-auth-service` cluster has `cx_total: 0` — zero gRPC connections to Authorino ever made
+> - Authorino logs show zero incoming requests after gateway pod restart
+> - Config churn is a secondary symptom (operator reconciles ~2/sec) but not the root cause — same behavior with operator scaled down and config stable
+>
+> **Why RHOAI forces RHCL 1.4.0:** RHOAI has zero OLM dependencies (`olm.package.required` is empty). However, the RHCL bundle declares catalog-level dependencies on `authorino-operator`, `limitador-operator`, and `dns-operator`. OLM auto-generates subscriptions for these on the `stable` channel with `Automatic` approval, which upgrades them to v1.4.0. The v1.4.0 sub-operators pull `rhcl-operator.v1.4.0` as a dependency.
+>
+> **Working configuration:** See the `rhcl-hack` branch — RHCL 1.3.4 + SM 3.2.5 with pre-created sub-operator subscriptions (Manual approval, `startingCSV` pinned to v1.3.1) installed BEFORE the RHCL operator. SM must be installed first (before any RHCL subscriptions) to avoid OLM bundling v1.4.0 upgrades into the SM install plan.
+>
+> For the full investigation, see [`maas_auth_enforcement_issue.md`](../maas_auth_enforcement_issue.md).
 
 ## Prerequisites
 
-- OpenShift 4.19+ cluster with BOM deployed ([`bom_rhoai_3.4.md`](../bom_rhoai_3.4.md)) — RHOAI 3.4, SM 3.2, RHCL 1.3, KServe, Dashboard
+- OpenShift 4.19+ cluster with BOM deployed ([`bom_rhoai_3.4.md`](../bom_rhoai_3.4.md)) — RHOAI 3.4, RHCL, SM, KServe, Dashboard
 - Let's Encrypt certificates installed on the cluster
-- RHBK operator installed on the cluster (from BOM or [`osac_platform_deployment.md`](../../execute/osac_platform_deployment.md))
 - `oc`, `jq`, `curl`, `envsubst` installed
 - GPU worker node (A10G) available (optional — simulator model runs on CPU)
 
@@ -18,16 +39,16 @@ echo "Cluster domain: ${DOMAIN}"
 ## Architecture
 
 ```
-User (JWT or API key)
+User (OpenShift token or API key)
     │
     ▼
 maas-default-gateway (HTTPS, Let's Encrypt)
     │
     ├── Gate 1: AuthPolicy (Authorino)
-    │     ├── Validate Keycloak JWT (OIDC)
+    │     ├── Validate OpenShift token (K8s TokenReview)
     │     ├── OR validate MaaS API key (sk-oai-*)
     │     ├── Extract: groups, userid
-    │     └── OPA: check group membership
+    │     └── Check group membership
     │
     ├── Gate 2: TokenRateLimitPolicy (Limitador)
     │     ├── Per-subscription token limits
@@ -36,20 +57,33 @@ maas-default-gateway (HTTPS, Let's Encrypt)
     └── Model backend (LLMInferenceService — simulator, CPU-only)
 ```
 
+## Auth Flow
+
+```
+1. Admin creates OpenShift Groups + Service Accounts (Phase 1)
+2. User creates a bound SA token: oc create token <sa> --audience=...
+3. User calls POST /maas-api/v1/api-keys with the SA token
+   → Authorino validates via K8s TokenReview
+   → maas-api reads X-MaaS-Username + X-MaaS-Group headers
+   → Creates sk-oai-* API key bound to user's subscription
+4. User calls inference endpoints with the API key
+   → Authorization: Bearer sk-oai-*
+```
+
 ## Subscriptions (Token Rate Limits)
 
-| Tier | Tokens/min | Groups | Priority |
-|------|-----------|--------|----------|
-| Free | 100 | `tier-free-users` | 0 |
-| Premium | 50,000 | `tier-premium-users` | 1 |
-| Enterprise | 100,000 | `tier-enterprise-users` | 2 |
+K8s TokenReview returns `system:serviceaccounts:<namespace>` as a group for service accounts — NOT OpenShift Groups. To map each tier to a unique group, we use one namespace per tier.
+
+| Tier | Tokens/min | K8s Group (from TokenReview) | Service Account | Priority |
+|------|-----------|------------------------------|-----------------|----------|
+| Free | 100 | `system:serviceaccounts:maas-free` | `maas-free:user` | 0 |
+| Premium | 50,000 | `system:serviceaccounts:maas-premium` | `maas-premium:user` | 1 |
+| Enterprise | 100,000 | `system:serviceaccounts:maas-enterprise` | `maas-enterprise:user` | 2 |
 
 ## Manifests
 
 | File | Purpose |
 |------|---------|
-| [`keycloak-maas-instance.yaml`](manifests/keycloak-maas-instance.yaml) | Separate Keycloak instance with edge TLS (requires `envsubst`) |
-| [`keycloak-realm-maas.yaml`](manifests/keycloak-realm-maas.yaml) | Keycloak realm with OIDC client, tier groups, test users |
 | [`user-workload-monitoring.yaml`](manifests/user-workload-monitoring.yaml) | Enable User Workload Monitoring for MaaS metrics |
 | [`kuadrant-instance.yaml`](manifests/kuadrant-instance.yaml) | Kuadrant CR (Authorino + Limitador) |
 | [`gateway-resources.yaml`](manifests/gateway-resources.yaml) | ConfigMap with gateway proxy memory limits (2Gi — prevents OOMKill) |
@@ -57,71 +91,54 @@ maas-default-gateway (HTTPS, Let's Encrypt)
 | [`postgres-maas.yaml`](manifests/postgres-maas.yaml) | Standalone PostgreSQL for maas-api |
 | [`model.yaml`](manifests/model.yaml) | LLMInferenceService (llm-d simulator, CPU-only) |
 | [`maas-model-ref.yaml`](manifests/maas-model-ref.yaml) | MaaSModelRef — register model with MaaS governance |
-| [`maas-auth-policy.yaml`](manifests/maas-auth-policy.yaml) | MaaSAuthPolicy — Keycloak groups to model access |
+| [`maas-auth-policy.yaml`](manifests/maas-auth-policy.yaml) | MaaSAuthPolicy — OpenShift groups to model access |
 | [`maas-subscriptions.yaml`](manifests/maas-subscriptions.yaml) | 3 MaaSSubscription CRs (free/premium/enterprise tiers) |
 
 ---
 
-## Phase 1: Keycloak MaaS Instance
+## Phase 1: Service Accounts (one namespace per tier)
 
-Deploy a **separate Keycloak instance** dedicated to MaaS — independent from the OSAC Keycloak. Uses edge TLS termination with the cluster's Let's Encrypt certificate so Authorino can verify OIDC discovery.
+Create one namespace per subscription tier with a service account in each. K8s TokenReview returns `system:serviceaccounts:<namespace>` as a group — this is what MaaS uses for subscription matching. No external IdP or OpenShift Groups needed.
 
-### 1a. Deploy Keycloak MaaS instance
-
-Deploys a self-contained Keycloak with its own PostgreSQL database and edge-terminated Route (trusted TLS via Let's Encrypt).
+### 1a. Create tier namespaces and service accounts
 
 ```shell
-envsubst < manifests/keycloak-maas-instance.yaml | oc apply -f -
+for TIER in free premium enterprise; do
+  oc create namespace "maas-${TIER}" || true
+  oc create sa user -n "maas-${TIER}"
+done
 ```
 
-Wait for PostgreSQL, then the RHBK operator, then Keycloak:
-```shell
-oc wait --for=condition=Available deployment/keycloak-postgres -n keycloak-maas --timeout=120s
-sleep 30
-oc wait --for=jsonpath='{.status.conditions[0].status}'=True keycloak/keycloak-maas -n keycloak-maas --timeout=300s
-oc get pods -n keycloak-maas --no-headers
-```
-
-### 1b. Create MaaS realm and client
+### 1b. Verify token and group membership
 
 ```shell
-export KEYCLOAK_URL="https://keycloak-maas.${DOMAIN}"
-oc apply -f manifests/keycloak-realm-maas.yaml
+TOKEN=$(oc create token user -n maas-premium \
+  --audience=https://kubernetes.default.svc \
+  --audience=maas-default-gateway-sa \
+  --duration=1h)
+
+echo "Token length: ${#TOKEN}"
+
+# Verify the token via TokenReview
+oc create -o json -f - <<EOF | jq '{authenticated: .status.authenticated, user: .status.user.username, groups: .status.user.groups}'
+{
+  "apiVersion": "authentication.k8s.io/v1",
+  "kind": "TokenReview",
+  "spec": {
+    "token": "${TOKEN}",
+    "audiences": ["https://kubernetes.default.svc", "maas-default-gateway-sa"]
+  }
+}
+EOF
+# Expected: authenticated=true, user=system:serviceaccount:maas-premium:user
+# groups: ["system:serviceaccounts", "system:serviceaccounts:maas-premium", "system:authenticated"]
 ```
-
-### 1c. Wait for realm import
-
-```shell
-oc wait keycloakrealmimport -n keycloak-maas maas-realm --for=condition=Done --timeout=300s
-```
-
-### 1d. Verify OIDC discovery (should work WITHOUT `-k` — trusted cert)
-
-```shell
-curl -s "${KEYCLOAK_URL}/realms/maas/.well-known/openid-configuration" | jq '{issuer, token_endpoint, jwks_uri}'
-```
-
-### 1d. Test token acquisition
-
-```shell
-ACCESS_TOKEN=$(curl -sk -X POST "${KEYCLOAK_URL}/realms/maas/protocol/openid-connect/token" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "client_id=maas-client" \
-  -d "client_secret=maas-client-secret-value" \
-  -d "username=testuser-premium" \
-  -d "password=password123" \
-  -d "grant_type=password" | jq -r '.access_token')
-
-echo $ACCESS_TOKEN | cut -d'.' -f2 | python3 -c "import sys,base64,json; print(json.dumps(json.loads(base64.urlsafe_b64decode(sys.stdin.read().strip()+'=='))))" | jq '{groups, preferred_username}'
-```
-
-Expected: `groups: ["tier-premium-users"]`
 
 ---
 
 ## Phase 2: MaaS Platform Prerequisites
 
-> ***These are prerequisites required by RHOAI 3.4** per the official MaaS documentation ([PDF](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/pdf/govern_llm_access_with_models-as-a-service/Red_Hat_OpenShift_AI_Self-Managed-3.4-Govern_LLM_access_with_Models-as-a-Service-en-US.pdf) | [HTML — requires login](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/govern_llm_access_with_models-as-a-service/)). They must be in place **before** enabling `modelsAsService` in the DataScienceCluster. RHOAI does not auto-provision these.
+> **These are prerequisites required by RHOAI 3.4** per the official MaaS documentation ([PDF](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/pdf/govern_llm_access_with_models-as-a-service/Red_Hat_OpenShift_AI_Self-Managed-3.4-Govern_LLM_access_with_Models-as-a-Service-en-US.pdf) | [HTML — requires login](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/govern_llm_access_with_models-as-a-service/)). They must be in place **before** enabling `modelsAsService` in the DataScienceCluster. RHOAI does not auto-provision these.
 
 ### 2a. Enable User Workload Monitoring
 
@@ -207,27 +224,25 @@ oc rollout status deployment/maas-api -n redhat-ods-applications --timeout=120s
 oc get tenant default-tenant -n models-as-a-service
 ```
 
-### 3c. Configure Tenant CR with Keycloak OIDC
+### 3c. Configure Tenant CR (no external OIDC)
+
+Without `externalOIDC`, the maas-api AuthPolicy uses only `openshift-identities` (K8s TokenReview) for non-API-key authentication. No IdP setup required.
 
 ```shell
-oc patch tenant default-tenant -n models-as-a-service --type=merge -p "{
-  \"spec\": {
-    \"gatewayRef\": {
-      \"namespace\": \"openshift-ingress\",
-      \"name\": \"maas-default-gateway\"
+oc patch tenant default-tenant -n models-as-a-service --type=merge -p '{
+  "spec": {
+    "gatewayRef": {
+      "namespace": "openshift-ingress",
+      "name": "maas-default-gateway"
     },
-    \"externalOIDC\": {
-      \"issuerUrl\": \"https://keycloak-maas.${DOMAIN}/realms/maas\",
-      \"clientId\": \"maas-client\"
+    "apiKeys": {
+      "maxExpirationDays": 90
     },
-    \"apiKeys\": {
-      \"maxExpirationDays\": 90
-    },
-    \"telemetry\": {
-      \"enabled\": true
+    "telemetry": {
+      "enabled": true
     }
   }
-}"
+}'
 ```
 
 ### 3d. Verify Tenant is Active
@@ -304,19 +319,16 @@ oc get tokenratelimitpolicy -A -o wide
 
 ## Phase 6: Test End-to-End
 
-> **Tested with:** SM 3.2.5 (Istio 1.26) + RHCL 1.3.4 — the [supported configuration](https://access.redhat.com/articles/7092611). Auth enforcement requires this version pairing. RHCL 1.4.0 + SM 3.2/3.3 does NOT work — see [`maas_auth_enforcement_issue.md`](../maas_auth_enforcement_issue.md).
+> **Testing with:** RHCL 1.4.0 + SM 3.3.4, OpenShift token auth (no external IdP).
 
 ### 6a. Set variables
 
 ```shell
 export DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
-export KEYCLOAK_URL="https://keycloak-maas.${DOMAIN}"
 export MAAS_API_URL="https://maas.${DOMAIN}"
 ```
 
 ### 6b. Test unauthenticated inference (expect 401)
-
-This is the critical test — verifies that the Kuadrant Wasm shim is properly calling Authorino and enforcing auth.
 
 ```shell
 curl -sk -w "\nHTTP_CODE: %{http_code}\n" \
@@ -324,22 +336,22 @@ curl -sk -w "\nHTTP_CODE: %{http_code}\n" \
   -d '{"model":"facebook/opt-125m","messages":[{"role":"user","content":"Hello"}],"max_tokens":50}' \
   "${MAAS_API_URL}/llm/facebook-opt-125m-simulated/v1/chat/completions"
 # Expected: HTTP 401
-# If you get HTTP 200, auth enforcement is broken — check operator versions (RHCL must be 1.3.x)
 ```
 
-### 6c. Create API key (premium tier)
-
-Authenticate with a Keycloak JWT to create an `sk-oai-*` API key. The key inherits the user's group membership for subscription resolution.
+### 6c. Create API key with OpenShift service account token
 
 ```shell
-ACCESS_TOKEN=$(curl -s -X POST "${KEYCLOAK_URL}/realms/maas/protocol/openid-connect/token" \
-  -d "client_id=maas-client" -d "client_secret=maas-client-secret-value" \
-  -d "username=testuser-premium" -d "password=password123" -d "grant_type=password" | jq -r '.access_token')
+# Create a bound token for the premium service account
+TOKEN=$(oc create token user -n maas-premium \
+  --audience=https://kubernetes.default.svc \
+  --audience=maas-default-gateway-sa \
+  --duration=1h)
 
+# Create API key
 API_KEY_RESPONSE=$(curl -sk -X POST "${MAAS_API_URL}/maas-api/v1/api-keys" \
-  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  -H "Authorization: Bearer ${TOKEN}" \
   -H "Content-Type: application/json" \
-  -d '{"name": "test-key-premium", "description": "Premium tier test key"}')
+  -d '{"name": "premium-sa-key", "description": "Premium tier via OpenShift SA token"}')
 
 echo "${API_KEY_RESPONSE}" | jq '{id, key: .key[:30], keyPrefix, subscription, expiresAt}'
 # Expected: HTTP 201, subscription=premium-subscription, key starts with sk-oai-
@@ -372,12 +384,11 @@ curl -sk -H "Authorization: Bearer ${API_KEY}" \
 
 ### 6e. Test token rate limiting (free tier)
 
-Create a free-tier API key (100 tokens/min) and send requests until rate limited.
-
 ```shell
-FREE_TOKEN=$(curl -s -X POST "${KEYCLOAK_URL}/realms/maas/protocol/openid-connect/token" \
-  -d "client_id=maas-client" -d "client_secret=maas-client-secret-value" \
-  -d "username=testuser-free" -d "password=password123" -d "grant_type=password" | jq -r '.access_token')
+FREE_TOKEN=$(oc create token user -n maas-free \
+  --audience=https://kubernetes.default.svc \
+  --audience=maas-default-gateway-sa \
+  --duration=1h)
 
 FREE_KEY=$(curl -sk -X POST "${MAAS_API_URL}/maas-api/v1/api-keys" \
   -H "Authorization: Bearer ${FREE_TOKEN}" \
@@ -404,30 +415,7 @@ done
 # Expected: first 1-3 requests succeed (200), then 429 after exceeding 100 tokens/min
 ```
 
-### 6f. Verify Wasm shim and operator versions
-
-```shell
-GATEWAY_POD=$(oc get pods -n openshift-ingress --no-headers | grep "maas-default-gateway-data" | awk '{print $1}')
-
-echo "=== Wasm warnings (should be 0) ==="
-oc logs -n openshift-ingress "${GATEWAY_POD}" -c istio-proxy --tail=100 | grep -c "allow_on_headers_stop_iteration"
-
-echo "=== Kuadrant stats ==="
-oc exec -n openshift-ingress "${GATEWAY_POD}" -c istio-proxy -- pilot-agent request GET /stats 2>/dev/null | grep "kuadrant\."
-# Expected: kuadrant.denied > 0 (from the unauthenticated test in 6b)
-# Expected: kuadrant.allowed > 0 (from the API key tests in 6d)
-
-echo "=== Operator version pinning ==="
-oc get csv -n openshift-operators --no-headers | grep -E 'rhcl|authorino|limitador|dns|servicemesh'
-# Expected: ALL at v1.3.x, SM at v3.2.5 — zero v1.4.0
-
-echo "=== Subscription names (no auto-generated) ==="
-oc get sub -n openshift-operators --no-headers
-# Expected: authorino-operator, limitador-operator, dns-operator, rhcl-operator, servicemeshoperator3
-# NOT auto-generated names like authorino-operator-stable-redhat-operators-openshift-marketplace
-```
-
-### 6g. Verify MaaS pipeline status
+### 6f. Verify MaaS pipeline status
 
 ```shell
 echo "=== Tenant ===" && oc get tenant default-tenant -n models-as-a-service -o jsonpath='{.status.phase}' && echo ""
@@ -443,13 +431,11 @@ echo "=== MaaSModelRef ===" && oc get maasmodelref -n llm --no-headers
 | Test | Expected | Validates |
 |------|----------|-----------|
 | Unauthenticated inference (6b) | HTTP 401 | Wasm shim + Authorino auth enforcement |
-| API key creation (6c) | HTTP 201, `sk-oai-*` key | maas-api auth headers (X-MaaS-Username/Group) |
+| API key creation with SA token (6c) | HTTP 201, `sk-oai-*` key | K8s TokenReview + maas-api auth headers |
 | GET /v1/models (6d) | HTTP 200, model list | API key auth + model catalog |
 | POST /v1/chat/completions (6d) | HTTP 200, chat response | API key auth + inference |
 | POST /v1/completions (6d) | HTTP 200, text completion | API key auth + inference |
 | Free tier rate limit (6e) | HTTP 429 after ~100 tokens | Token rate limiting via Limitador |
-| Wasm warnings (6f) | 0 warnings | RHCL 1.3.x compatibility with SM 3.2 |
-| Operator versions (6f) | All v1.3.x, SM v3.2.5 | Version pinning held through deployment |
 
 ---
 
@@ -463,9 +449,8 @@ oc delete -f manifests/maas-model-ref.yaml
 oc delete -f manifests/model.yaml
 oc delete namespace llm
 
-# Remove Tenant OIDC config
-oc patch tenant default-tenant -n models-as-a-service --type=json \
-  -p '[{"op":"remove","path":"/spec/externalOIDC"}]'
+# Remove tier namespaces (service accounts are deleted with the namespace)
+oc delete namespace maas-free maas-premium maas-enterprise --ignore-not-found
 
 # Remove maas-api database secret
 oc delete secret maas-db-config -n redhat-ods-applications
@@ -481,9 +466,6 @@ oc delete -f manifests/kuadrant-instance.yaml
 
 # Remove monitoring config
 oc delete -f manifests/user-workload-monitoring.yaml
-
-# Remove Keycloak MaaS instance
-oc delete namespace keycloak-maas
 
 # Disable MaaS in DSC
 oc patch datasciencecluster default-dsc --type=merge -p '{
