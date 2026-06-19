@@ -662,6 +662,8 @@ oc wait --for=condition=ReconcileComplete dsci/default-dsci --timeout=600s
 The DSC enables KServe for model serving and the OpenShift AI Dashboard for tenant self-service. The dashboard provides the web UI for model management, endpoint monitoring, and project navigation — essential on the tenant cluster where admins and users interact with MaaS.
 
 
+> **Note**: RHOAI 3.4 renamed several DSC components from earlier versions. The old names (`codeflare`, `datasciencepipelines`, `modelmeshserving`) are no longer valid. New components include `aipipelines`, `feastoperator`, `llamastackoperator`, `modelregistry`, `sparkoperator`, `trainer`. The `kueue` component does NOT support `Managed` — the RHOAI webhook rejects it; use `Removed`.
+
 ```shell
 oc apply -f - <<'EOF'
 apiVersion: datasciencecluster.opendatahub.io/v1
@@ -670,27 +672,33 @@ metadata:
   name: default-dsc
 spec:
   components:
-    codeflare:
+    aipipelines:
       managementState: Removed
     dashboard:
       managementState: Managed
-    datasciencepipelines:
+    feastoperator:
       managementState: Removed
     kserve:
       managementState: Managed
     kueue:
       managementState: Removed
-    modelmeshserving:
+    llamastackoperator:
+      managementState: Removed
+    mlflowoperator:
+      managementState: Removed
+    modelregistry:
       managementState: Removed
     ray:
+      managementState: Removed
+    sparkoperator:
+      managementState: Removed
+    trainer:
       managementState: Removed
     trainingoperator:
       managementState: Removed
     trustyai:
       managementState: Removed
     workbenches:
-      managementState: Removed
-    mlflowoperator:
       managementState: Removed
 EOF
 ```
