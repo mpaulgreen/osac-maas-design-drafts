@@ -1,4 +1,4 @@
-# ModelServices API — Detailed Proto Design
+# ModelServices API — Detailed Proto Design (Very Early Draft)
 
 *Comprehensive reference for every field, enum, and design decision in the ModelServices fulfillment API resource.*
 
