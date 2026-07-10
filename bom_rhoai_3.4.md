@@ -2,6 +2,28 @@
 
 *Deployment guide for OpenShift AI 3.4 with KServe, MaaS (GA), and GPU support for LLM inference.*
 
+## Validated Operator Inventory
+
+The following operator versions have been validated end-to-end on OCP 4.19.17 with MaaS auth enforcement (401 for unauthenticated requests), API key creation, inference, and token rate limiting all confirmed working.
+
+| Operator | Version | CSV | Channel | Approval |
+|----------|---------|-----|---------|----------|
+| Red Hat OpenShift AI | **3.4.0** | `rhods-operator.3.4.0` | `stable-3.4` | Automatic |
+| Red Hat Connectivity Link | **1.3.4** | `rhcl-operator.v1.3.4` | `stable` | Manual |
+| Authorino Operator | **1.3.1** | `authorino-operator.v1.3.1` | `stable` | Manual |
+| Limitador Operator | **1.3.1** | `limitador-operator.v1.3.1` | `stable` | Manual |
+| DNS Operator | **1.3.1** | `dns-operator.v1.3.1` | `stable` | Manual |
+| Red Hat OpenShift Service Mesh 3 | **3.2.5** | `servicemeshoperator3.v3.2.5` | `stable-3.2` | Manual |
+| cert-manager Operator | **1.18.1** | `cert-manager-operator.v1.18.1` | `stable-v1.18` | Automatic |
+| NVIDIA GPU Operator | **26.3.2** | `gpu-operator-certified.v26.3.2` | `v26.3` | Automatic |
+| Node Feature Discovery Operator | **4.19.0** | `nfd.4.19.0-202605290618` | `stable` | Automatic |
+| Red Hat build of Leader Worker Set | **1.0.0** | `leader-worker-set.v1.0.0` | `stable-v1.0` | Automatic |
+| Red Hat build of Keycloak Operator | **26.4.12** | `rhbk-operator.v26.4.12-opr.1` | `stable-v26.4` | Automatic |
+
+> **Version pinning is critical.** RHCL, Authorino, Limitador, DNS, and SM must use `Manual` approval to prevent OLM from auto-upgrading to v1.4.0 / SM 3.3.x. RHCL 1.4.0's Kuadrant Wasm shim requires `allow_on_headers_stop_iteration` — a field not supported by any SM version on OCP 4.19. See the installation order notes in Phase 2 for details.
+
+---
+
 ## Target Stack & Versions
 
 ### Platform
@@ -21,11 +43,24 @@
 
 | Component | Version | Channel | Catalog | Notes |
 |-----------|---------|---------|---------|-------|
-| cert-manager for Red Hat OpenShift | **1.18.1** (upstream v1.18.4) | `stable-v1` | `redhat-operators` | [OCP 4.20 Docs](https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/html/security_and_compliance/cert-manager-operator-for-red-hat-openshift) |
-| Red Hat Connectivity Link (RHCL) | **1.4.0** | `stable` | `redhat-operators` | [RHCL Docs](https://docs.redhat.com/en/documentation/red_hat_connectivity_link/). Bundles: Authorino Operator 1.4.0, Limitador Operator 1.4.0, DNS Operator 1.4.0 |
+| cert-manager for Red Hat OpenShift | **1.18.x** | `stable-v1.18` | `redhat-operators` | Pinned to 1.18 per RHCL 1.3 [supported configs](https://access.redhat.com/articles/7092611) |
+| Red Hat Connectivity Link (RHCL) | **1.3.x** | `stable` | `redhat-operators` | [RHCL Docs](https://docs.redhat.com/en/documentation/red_hat_connectivity_link/1.3). Bundles: Authorino, Limitador, DNS operators. See version matrix note below. |
 | Leader Worker Set Operator | **1.0.x** (GA in OCP 4.20) | `stable-v1.0` | `redhat-operators` | [OCP 4.20 AI Workloads](https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/html/ai_workloads/leader-worker-set-operator) |
 | Red Hat OpenShift AI (RHOAI) | **3.4.x** | `stable-3.4` | `redhat-operators` | [Release Notes](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/release_notes/index) |
-| Red Hat OpenShift Service Mesh 3 | **3.3.3** | platform-managed (Ingress Operator) | `redhat-operators` | Auto-installed on OCP 4.19; RHOAI uses it directly |
+| Red Hat OpenShift Service Mesh 3 | **3.2.5** | `stable-3.2` | `redhat-operators` | **Pre-install BEFORE RHOAI** to prevent SM 3.3.3 auto-install. See version matrix note below. |
+
+> **RHCL / Service Mesh Version Matrix — Critical for MaaS Auth Enforcement**
+>
+> Per the [RHCL Supported Configurations](https://access.redhat.com/articles/7092611):
+>
+> | RHCL Version | Required Service Mesh | cert-manager |
+> |---|---|---|
+> | 1.3 | 3.2 | 1.18 |
+> | 1.2 | 3.1 | 1.17 |
+>
+> RHOAI 3.4 MaaS requires [RHCL 1.2 or later](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/govern_llm_access_with_models-as-a-service/). For MaaS auth enforcement to work, the RHCL and Service Mesh versions **must** match the supported matrix. Mismatches cause the Kuadrant Wasm shim to fail silently, resulting in unauthenticated requests being allowed (HTTP 200 instead of 401).
+>
+> **Known issue:** OCP 4.19 Ingress Operator installs Service Mesh 3.1.x. RHOAI may auto-upgrade it to 3.3.3 via OLM install plans. The RHCL `stable` channel auto-upgrades to 1.4.0. Neither RHCL 1.3 + SM 3.3.3 nor RHCL 1.4.0 + SM 3.3.3 is in the supported matrix. Use `installPlanApproval: Manual` for RHCL to stay on 1.3.x, and approve Service Mesh install plans carefully to stay on 3.2.x. If your versions don't match the matrix, verify auth enforcement (`curl` without credentials should return 401) and file a Red Hat support case if it doesn't.
 
 ### MaaS & AI Components (via DataScienceCluster)
 
@@ -279,11 +314,17 @@ Expected: GPU count > 0, no pods in non-Ready state.
 
 ## Phase 2: Platform Operator Installation
 
+> **Critical: Installation order matters.** SM must be installed BEFORE RHCL sub-operators. If RHCL subscriptions exist when SM is installed, OLM bundles pending v1.4.0 upgrade plans into the SM install plan — making it impossible to approve SM without also upgrading to v1.4.0. The correct order is: cert-manager → SM → RHCL sub-operators + RHCL → LWS → RHOAI.
+
 ### 2.1 — cert-manager (skip if already present)
 
 ```shell
 # Check if already installed
-oc get csv -A | grep cert-manager && echo "Already installed — skip this step"
+if oc get csv -A 2>/dev/null | grep -q cert-manager; then
+  echo "Already installed -- skip this step"
+else
+  echo "Not installed -- proceeding with install"
+fi
 
 # Install if not present
 oc apply -f - <<'EOF'
@@ -305,7 +346,7 @@ metadata:
   name: openshift-cert-manager-operator
   namespace: cert-manager-operator
 spec:
-  channel: stable-v1
+  channel: stable-v1.18
   installPlanApproval: Automatic
   name: openshift-cert-manager-operator
   source: redhat-operators
@@ -320,9 +361,128 @@ oc get csv -n cert-manager-operator | grep cert-manager
 # Expected: cert-manager-operator.v1.18.1   Succeeded
 ```
 
-### 2.2 — Red Hat Connectivity Link (RHCL)
+### 2.2 — Service Mesh 3.2 (install FIRST — before RHCL)
+
+SM must be the first operator installed in `openshift-operators` to ensure a clean install plan. If RHCL subscriptions already exist with pending v1.4.0 upgrade plans, OLM bundles them into the SM install plan — making it impossible to get SM 3.2.5 without also upgrading RHCL to v1.4.0.
+
+> **Why `stable-3.2` and not `stable`?** On OCP 4.19, the `stable` channel resolves to SM 3.3.3. The `stable-3.2` channel pins to SM 3.2.x, matching the [RHCL 1.3 supported configuration](https://access.redhat.com/articles/7092611). Use `Manual` approval to prevent any auto-upgrade.
+
+```shell
+oc apply -f - <<'EOF'
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: servicemeshoperator3
+  namespace: openshift-operators
+spec:
+  channel: stable-3.2
+  installPlanApproval: Manual
+  name: servicemeshoperator3
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: servicemeshoperator3.v3.2.5
+EOF
+```
+
+Approve the install plan:
+```shell
+sleep 30
+
+# Approve SM 3.2.x install plan (reject any that bundle v1.4.0)
+for plan in $(oc get installplan -n openshift-operators --no-headers | grep -v Complete | awk '{print $1}'); do
+  CSVS=$(oc get installplan $plan -n openshift-operators -o jsonpath='{.spec.clusterServiceVersionNames}')
+  if echo "$CSVS" | grep -q "v1.4.0"; then
+    echo "SKIP $plan (contains v1.4.0 — do NOT approve)"
+  elif echo "$CSVS" | grep -q "servicemeshoperator3"; then
+    oc patch installplan $plan -n openshift-operators --type merge --patch '{"spec":{"approved":true}}'
+    echo "APPROVED $plan: $CSVS"
+  fi
+done
+```
+
+Verify:
+```shell
+oc wait csv servicemeshoperator3.v3.2.5 -n openshift-operators --for=jsonpath='{.status.phase}'=Succeeded --timeout=300s
+oc get csv -n openshift-operators | grep servicemesh
+# Expected: servicemeshoperator3.v3.2.5   Succeeded
+```
+
+### 2.3 — Red Hat Connectivity Link (RHCL) and Sub-Operators
 
 RHCL provides Authorino (auth/authz) and Limitador (rate limiting) for MaaS. Starting with RHOAI 3.4, RHCL is included in Red Hat AI SKUs for MaaS use cases.
+
+> **Critical: Pre-create sub-operator subscriptions BEFORE RHCL.**
+>
+> The RHCL bundle declares catalog-level dependencies on `authorino-operator`, `limitador-operator`, and `dns-operator`. Without pre-existing subscriptions, OLM auto-generates subscriptions for these packages on the `stable` channel with `Automatic` approval — which upgrades them to v1.4.0. RHCL 1.4.0's Kuadrant Wasm shim requires `allow_on_headers_stop_iteration`, a field not supported by any SM version on OCP 4.19 (SM 3.2 uses Istio 1.26, SM 3.3 uses Istio 1.27). This breaks ALL MaaS auth enforcement.
+>
+> The fix: pre-create subscriptions with `Manual` approval pinned to v1.3.x. OLM finds these existing subscriptions and does NOT auto-generate new ones.
+
+#### Step 1: Pre-create sub-operator subscriptions (pinned to v1.3.x)
+
+```shell
+oc apply -f - <<'EOF'
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: authorino-operator
+  namespace: openshift-operators
+spec:
+  channel: stable
+  installPlanApproval: Manual
+  name: authorino-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: authorino-operator.v1.3.1
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: limitador-operator
+  namespace: openshift-operators
+spec:
+  channel: stable
+  installPlanApproval: Manual
+  name: limitador-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: limitador-operator.v1.3.1
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: dns-operator
+  namespace: openshift-operators
+spec:
+  channel: stable
+  installPlanApproval: Manual
+  name: dns-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: dns-operator.v1.3.1
+EOF
+```
+
+Approve only v1.3.x install plans:
+```shell
+sleep 30
+
+for plan in $(oc get installplan -n openshift-operators --no-headers | grep -v Complete | awk '{print $1}'); do
+  CSVS=$(oc get installplan $plan -n openshift-operators -o jsonpath='{.spec.clusterServiceVersionNames}')
+  if echo "$CSVS" | grep -q "v1.4.0"; then
+    echo "SKIP $plan (contains v1.4.0 — do NOT approve)"
+  else
+    oc patch installplan $plan -n openshift-operators --type merge --patch '{"spec":{"approved":true}}'
+    echo "APPROVED $plan: $CSVS"
+  fi
+done
+
+# Wait for sub-operator CSVs
+sleep 30
+oc get csv -n openshift-operators | grep -E 'authorino|limitador|dns'
+# Expected: v1.3.x versions — all Succeeded
+```
+
+#### Step 2: Install RHCL operator (pinned to v1.3.4)
 
 ```shell
 oc apply -f - <<'EOF'
@@ -333,35 +493,44 @@ metadata:
   namespace: openshift-operators
 spec:
   channel: stable
-  installPlanApproval: Automatic
+  installPlanApproval: Manual
   name: rhcl-operator
   source: redhat-operators
   sourceNamespace: openshift-marketplace
+  startingCSV: rhcl-operator.v1.3.4
 EOF
 ```
 
-Wait for RHCL and its bundled operators:
+Approve only the v1.3.x install plan:
 ```shell
-sleep 60
+sleep 30
 
-# Approve Authorino install plan if pending
-AUTH_IP=$(oc get installplan -n openshift-operators -o json | \
-  jq -r '.items[] | select(.spec.clusterServiceVersionNames[] | contains("authorino")) | select(.spec.approved==false) | .metadata.name')
-if [ -n "$AUTH_IP" ]; then
-  oc patch installplan "$AUTH_IP" -n openshift-operators --type merge -p '{"spec":{"approved":true}}'
-fi
+for plan in $(oc get installplan -n openshift-operators --no-headers | grep -v Complete | awk '{print $1}'); do
+  CSVS=$(oc get installplan $plan -n openshift-operators -o jsonpath='{.spec.clusterServiceVersionNames}')
+  if echo "$CSVS" | grep -q "v1.4.0"; then
+    echo "SKIP $plan (contains v1.4.0 — do NOT approve)"
+  else
+    oc patch installplan $plan -n openshift-operators --type merge --patch '{"spec":{"approved":true}}'
+    echo "APPROVED $plan: $CSVS"
+  fi
+done
 ```
 
-Verify all RHCL components:
+Verify all RHCL components (should be 1.3.x, NOT 1.4.0):
 ```shell
 oc get csv -n openshift-operators | grep -E 'rhcl|authorino|limitador|dns'
-# Expected: 4 operators — rhcl, authorino, limitador, dns — all Succeeded
+# Expected: 4 operators at 1.3.x versions — all Succeeded
+# If any show 1.4.0, the auto-upgrade was not blocked — see version matrix note above
+
+oc get sub -n openshift-operators
+# Expected: our named subscriptions (authorino-operator, limitador-operator, dns-operator, rhcl-operator, servicemeshoperator3)
+# NOT auto-generated ones like authorino-operator-stable-redhat-operators-openshift-marketplace
 
 oc get crd | grep -E 'authpolicies|dnspolicies|ratelimitpolicies|tokenratelimitpolicies'
 # Expected: AuthPolicy, DNSPolicy, RateLimitPolicy, TokenRateLimitPolicy CRDs
 ```
 
-### 2.3 — Leader Worker Set Operator
+### 2.4 — Leader Worker Set Operator
 
 Required for distributed inference workloads (llm-d).
 
@@ -401,7 +570,7 @@ oc wait --for=condition=CatalogSourcesUnhealthy=False subscription/leader-worker
 oc get csv -n openshift-lws-operator | grep leader-worker-set
 ```
 
-### 2.4 — Red Hat OpenShift AI 3.4
+### 2.5 — Red Hat OpenShift AI 3.4
 
 ```shell
 oc apply -f - <<'EOF'
@@ -431,19 +600,41 @@ spec:
 EOF
 ```
 
-Wait for the operator and auto-installed Service Mesh 3:
+Wait for the RHOAI operator:
 ```shell
-sleep 180
+sleep 120
 
-# Service Mesh 3 operator install plan may need manual approval
-SM_IP=$(oc get installplan -n openshift-operators -o json | \
-  jq -r '.items[] | select(.spec.clusterServiceVersionNames[] | contains("servicemeshoperator3")) | select(.spec.approved==false) | .metadata.name')
-if [ -n "$SM_IP" ]; then
-  oc patch installplan "$SM_IP" -n openshift-operators --type merge -p '{"spec":{"approved":true}}'
-fi
+oc wait --for=condition=CatalogSourcesUnhealthy=False subscription/rhods-operator -n redhat-ods-operator --timeout=300s
+```
 
-# Wait for Service Mesh operator
-oc wait --for=condition=CatalogSourcesUnhealthy=False subscription/servicemeshoperator3 -n openshift-operators --timeout=300s 2>/dev/null || echo "Service Mesh subscription not yet created — RHOAI may still be initializing"
+> **Important:** The OCP Ingress Operator (`ingress.operator.openshift.io/owned` annotation) takes ownership of the SM subscription and changes the channel from `stable-3.2` to `stable`. This is expected — the `installPlanApproval: Manual` is preserved, so upgrade plans to SM 3.3.x will not auto-install. The SM CSV stays at 3.2.5.
+>
+> Additionally, RHOAI may auto-create a SM subscription on the `stable` channel. If it does, **delete it** — SM 3.2.5 is already installed from step 2.2.
+
+Check the SM subscription channel:
+```shell
+oc get sub servicemeshoperator3 -n openshift-operators -o jsonpath='{.spec.channel}' && echo ""
+# If "stable" — run the fix below. If "stable-3.2" — skip.
+```
+
+If the channel was changed to `stable`, delete and recreate on `stable-3.2`:
+```shell
+oc delete sub servicemeshoperator3 -n openshift-operators
+
+oc apply -f - <<'EOF'
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: servicemeshoperator3
+  namespace: openshift-operators
+spec:
+  channel: stable-3.2
+  installPlanApproval: Manual
+  name: servicemeshoperator3
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: servicemeshoperator3.v3.2.5
+EOF
 ```
 
 Verify:
@@ -452,7 +643,7 @@ oc get csv -n redhat-ods-operator | grep rhods
 # Expected: rhods-operator.3.4.x   Succeeded
 
 oc get csv -n openshift-operators | grep servicemesh
-# Expected: servicemeshoperator3.v3.2.x   Succeeded
+# Expected: servicemeshoperator3.v3.2.5   Succeeded (NOT 3.3.3)
 ```
 
 ---
@@ -479,27 +670,33 @@ metadata:
   name: default-dsc
 spec:
   components:
-    codeflare:
+    aipipelines:
       managementState: Removed
     dashboard:
       managementState: Managed
-    datasciencepipelines:
+    feastoperator:
       managementState: Removed
     kserve:
       managementState: Managed
     kueue:
       managementState: Removed
-    modelmeshserving:
+    llamastackoperator:
+      managementState: Removed
+    mlflowoperator:
+      managementState: Removed
+    modelregistry:
       managementState: Removed
     ray:
+      managementState: Removed
+    sparkoperator:
+      managementState: Removed
+    trainer:
       managementState: Removed
     trainingoperator:
       managementState: Removed
     trustyai:
       managementState: Removed
     workbenches:
-      managementState: Removed
-    mlflowoperator:
       managementState: Removed
 EOF
 ```
@@ -547,7 +744,7 @@ echo "Dashboard URL: https://${DASHBOARD_ROUTE}"
 
 echo "=== 7. Service Mesh Operator ==="
 oc get csv -n openshift-operators | grep servicemeshoperator3
-# Expected: Succeeded
+# Expected: servicemeshoperator3.v3.2.5   Succeeded (NOT 3.3.3)
 
 echo "=== 8. KServe API ==="
 oc api-resources --api-group=serving.kserve.io --no-headers
@@ -558,8 +755,19 @@ oc api-resources --api-group=maas.opendatahub.io --no-headers 2>/dev/null
 # Expected: MaaSModelRef, MaaSSubscription, MaaSAuthPolicy, Tenant, AITenant, etc.
 
 echo "=== 10. RHCL / Kuadrant CRDs ==="
-oc get crd | grep -E 'authpolicies|ratelimitpolicies|tokenratelimitpolicies' --no-headers
+oc get crd --no-headers | grep -E 'authpolicies|ratelimitpolicies|tokenratelimitpolicies'
 # Expected: AuthPolicy, RateLimitPolicy, TokenRateLimitPolicy
+
+echo "=== 11. RHCL Version Pinning (critical) ==="
+oc get csv -n openshift-operators | grep -E 'rhcl|authorino|limitador|dns'
+# Expected: ALL at v1.3.x — zero v1.4.0
+# If any show v1.4.0, the pre-create strategy in step 2.3 was not followed correctly
+
+echo "=== 12. Subscription Names ==="
+oc get sub -n openshift-operators --no-headers
+# Expected: our named subscriptions only:
+#   authorino-operator, limitador-operator, dns-operator, rhcl-operator, servicemeshoperator3
+# NOT auto-generated names like authorino-operator-stable-redhat-operators-openshift-marketplace
 ```
 
 ---
@@ -576,7 +784,7 @@ If all verification steps pass, the following stack is operational:
 ├─────────────────────────────────────────────┤
 │ Platform Layer                               │
 │  cert-manager → TLS certificates             │
-│  Service Mesh 3 (Istio 1.27) → gateway API   │
+│  Service Mesh 3.2 (Istio 1.26) → gateway API  │
 │  RHCL → Authorino (auth) + Limitador (rate)  │
 │  Leader Worker Set → distributed inference   │
 ├─────────────────────────────────────────────┤

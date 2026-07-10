@@ -1,0 +1,109 @@
+apiVersion: k8s.keycloak.org/v2alpha1
+kind: KeycloakRealmImport
+metadata:
+  name: maas-realm
+  namespace: keycloak-maas
+spec:
+  keycloakCRName: keycloak-maas
+  realm:
+    realm: maas
+    enabled: true
+
+    clientScopes:
+    - name: groups
+      description: Group membership claim
+      protocol: openid-connect
+      attributes:
+        include.in.token.scope: "false"
+        display.on.consent.screen: "true"
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        consentRequired: false
+        config:
+          full.path: "false"
+          introspection.token.claim: "true"
+          multivalued: "true"
+          userinfo.token.claim: "true"
+          id.token.claim: "true"
+          access.token.claim: "true"
+          claim.name: groups
+      - name: username
+        protocol: openid-connect
+        protocolMapper: oidc-usermodel-attribute-mapper
+        consentRequired: false
+        config:
+          user.attribute: username
+          claim.name: preferred_username
+          id.token.claim: "true"
+          access.token.claim: "true"
+          jsonType.label: String
+
+    defaultDefaultClientScopes:
+    - basic
+    - groups
+
+    clients:
+    - clientId: maas-client
+      name: MaaS Client
+      enabled: true
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: maas-client-secret-value
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: true
+      serviceAccountsEnabled: false
+      protocol: openid-connect
+      defaultClientScopes:
+      - basic
+      - profile
+      - groups
+      redirectUris:
+      - http://localhost
+      - http://localhost:8080/callback
+
+    groups:
+    - name: tier-free-users
+    - name: tier-premium-users
+    - name: tier-enterprise-users
+
+    users:
+    - username: testuser-free
+      firstName: Test
+      lastName: Free
+      email: testuser-free@test.com
+      emailVerified: true
+      enabled: true
+      credentials:
+      - type: password
+        value: password123
+        temporary: false
+      groups:
+      - tier-free-users
+
+    - username: testuser-premium
+      firstName: Test
+      lastName: Premium
+      email: testuser-premium@test.com
+      emailVerified: true
+      enabled: true
+      credentials:
+      - type: password
+        value: password123
+        temporary: false
+      groups:
+      - tier-premium-users
+
+    - username: testuser-enterprise
+      firstName: Test
+      lastName: Enterprise
+      email: testuser-enterprise@test.com
+      emailVerified: true
+      enabled: true
+      credentials:
+      - type: password
+        value: password123
+        temporary: false
+      groups:
+      - tier-enterprise-users
