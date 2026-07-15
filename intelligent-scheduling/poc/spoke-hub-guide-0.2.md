@@ -14,7 +14,11 @@
                     │        Hub InferencePool → Hub EPP               │
                     │                    ┌──┴──┐                      │
                     │                proxy-1  proxy-2                 │
-                    │                (SA token auth, not MaaS key)    │
+                    │                 ┌──────────────┐               │
+                    │                 │ nginx :8080  │ (inference)   │
+                    │                 │ sidecar:8081 │ (metrics/TLS) │
+                    │                 └──────────────┘               │
+                    │                (SA token auth, cert-manager TLS)│
                     └───────────────┬──────────┬──────────────────────┘
                                    │          │
                     ┌──────────────┘          └──────────────┐
@@ -44,6 +48,8 @@
 | Spoke governance CRs | MaaSModelRef + MaaSAuthPolicy + MaaSSubscription | None |
 | Proxy credential | `sk-oai-...` | K8s SA token |
 | Spoke deployment | `ansible-playbook --tags full` (683s) | `ansible-playbook --tags full -e enable_maas=false` (~300s) |
+| Metrics path | nginx `/metrics` on proxy (port 8080) | Dedicated TLS sidecar (port 8081, cert-manager cert) — nginx not in metrics flow |
+| Hub EPP metrics scraping | `http://<pod>:8080/metrics` | `https://<pod>:8081/metrics` (TLS, cert-manager signed) |
 
 ## Cluster Roles
 
@@ -428,12 +434,6 @@ data:
           proxy_read_timeout 5s;
         }
 
-        location = /metrics {
-          proxy_set_header Host <SPOKE1_METRICS_ROUTE>;
-          proxy_set_header Authorization "Bearer <SPOKE1_METRICS_TOKEN>";
-          proxy_pass https://<SPOKE1_METRICS_ROUTE>/metrics;
-        }
-
         location / {
           proxy_pass https://<SPOKE1_NLB>/granite-serving/granite-3-1-8b-fp8/;
         }
@@ -480,12 +480,6 @@ data:
           proxy_read_timeout 5s;
         }
 
-        location = /metrics {
-          proxy_set_header Host <SPOKE2_METRICS_ROUTE>;
-          proxy_set_header Authorization "Bearer <SPOKE2_METRICS_TOKEN>";
-          proxy_pass https://<SPOKE2_METRICS_ROUTE>/metrics;
-        }
-
         location / {
           proxy_pass https://<SPOKE2_NLB>/granite-serving/granite-3-1-8b-fp8/;
         }
@@ -494,7 +488,101 @@ data:
 EOF
 ```
 
-Create proxy Deployments + Service (same as 0.1 — upstream health readiness, gRPC liveness):
+### 2.1a Create metrics sidecar infrastructure
+
+The metrics path is **decoupled from nginx** — a dedicated sidecar container serves spoke EPP metrics over TLS on port 8081. OpenShift service-ca auto-generates the TLS certificate.
+
+```bash
+# Metrics Service with serving-cert annotation (auto-creates TLS Secret)
+oc apply -f - <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: hub-pool-metrics
+  namespace: llm-d-hub
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: metrics-sidecar-tls
+spec:
+  selector:
+    app: hub-pool
+  ports:
+    - name: metrics
+      port: 8081
+      targetPort: 8081
+EOF
+
+# Wait for cert auto-generation
+sleep 10
+oc get secret metrics-sidecar-tls -n llm-d-hub --no-headers
+```
+
+Create metrics sidecar ConfigMaps (replace `<SPOKE*_METRICS_ROUTE>` and `<SPOKE*_METRICS_TOKEN>` with values from Part 1):
+
+```bash
+oc apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metrics-spoke-1
+  namespace: llm-d-hub
+data:
+  nginx.conf: |
+    pid /tmp/nginx-metrics.pid;
+    events {}
+    http {
+      client_body_temp_path /tmp/m_client_temp;
+      proxy_temp_path /tmp/m_proxy_temp;
+      fastcgi_temp_path /tmp/m_fastcgi_temp;
+      uwsgi_temp_path /tmp/m_uwsgi_temp;
+      scgi_temp_path /tmp/m_scgi_temp;
+      server {
+        listen 8081 ssl;
+        ssl_certificate /etc/tls/tls.crt;
+        ssl_certificate_key /etc/tls/tls.key;
+        location = /metrics {
+          proxy_set_header Host <SPOKE1_METRICS_ROUTE>;
+          proxy_set_header Authorization "Bearer <SPOKE1_METRICS_TOKEN>";
+          proxy_ssl_verify off;
+          proxy_pass https://<SPOKE1_METRICS_ROUTE>/metrics;
+        }
+        location = /healthz { return 200 "ok\n"; }
+      }
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metrics-spoke-2
+  namespace: llm-d-hub
+data:
+  nginx.conf: |
+    pid /tmp/nginx-metrics.pid;
+    events {}
+    http {
+      client_body_temp_path /tmp/m_client_temp;
+      proxy_temp_path /tmp/m_proxy_temp;
+      fastcgi_temp_path /tmp/m_fastcgi_temp;
+      uwsgi_temp_path /tmp/m_uwsgi_temp;
+      scgi_temp_path /tmp/m_scgi_temp;
+      server {
+        listen 8081 ssl;
+        ssl_certificate /etc/tls/tls.crt;
+        ssl_certificate_key /etc/tls/tls.key;
+        location = /metrics {
+          proxy_set_header Host <SPOKE2_METRICS_ROUTE>;
+          proxy_set_header Authorization "Bearer <SPOKE2_METRICS_TOKEN>";
+          proxy_ssl_verify off;
+          proxy_pass https://<SPOKE2_METRICS_ROUTE>/metrics;
+        }
+        location = /healthz { return 200 "ok\n"; }
+      }
+    }
+EOF
+```
+
+> **Why a sidecar?** hexfusion feedback: "EPP hub to spoke /metrics should probably be mTLS which removes the proxy dependency." The sidecar decouples metrics from inference — nginx handles only inference + health (port 8080), the sidecar handles only metrics over TLS (port 8081). Hub EPP scrapes the sidecar directly.
+
+Create proxy Deployments + Service with metrics sidecar:
 
 ```bash
 oc apply -f - <<'EOF'
@@ -524,7 +612,7 @@ spec:
           ports:
             - containerPort: 8080
           volumeMounts:
-            - name: cfg
+            - name: inference-cfg
               mountPath: /etc/nginx/nginx.conf
               subPath: nginx.conf
           readinessProbe:
@@ -540,10 +628,27 @@ spec:
               path: /healthz
               port: 8080
             periodSeconds: 10
+        - name: metrics
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          ports:
+            - containerPort: 8081
+          volumeMounts:
+            - name: metrics-cfg
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: tls-cert
+              mountPath: /etc/tls
+              readOnly: true
       volumes:
-        - name: cfg
+        - name: inference-cfg
           configMap:
             name: proxy-spoke-1
+        - name: metrics-cfg
+          configMap:
+            name: metrics-spoke-1
+        - name: tls-cert
+          secret:
+            secretName: metrics-sidecar-tls
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -571,7 +676,7 @@ spec:
           ports:
             - containerPort: 8080
           volumeMounts:
-            - name: cfg
+            - name: inference-cfg
               mountPath: /etc/nginx/nginx.conf
               subPath: nginx.conf
           readinessProbe:
@@ -587,10 +692,27 @@ spec:
               path: /healthz
               port: 8080
             periodSeconds: 10
+        - name: metrics
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          ports:
+            - containerPort: 8081
+          volumeMounts:
+            - name: metrics-cfg
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: tls-cert
+              mountPath: /etc/tls
+              readOnly: true
       volumes:
-        - name: cfg
+        - name: inference-cfg
           configMap:
             name: proxy-spoke-2
+        - name: metrics-cfg
+          configMap:
+            name: metrics-spoke-2
+        - name: tls-cert
+          secret:
+            secretName: metrics-sidecar-tls
 ---
 apiVersion: v1
 kind: Service
@@ -612,9 +734,13 @@ echo "=== Verify ===" && oc get pods -n llm-d-hub --no-headers | grep spoke
 echo "=== Endpoints (expect 2) ===" && oc get endpoints hub-pool-svc -n llm-d-hub
 ```
 
-**Expected**: 2 proxy pods `1/1 Running`, 2 endpoints. If `0/1`, the upstream-health check is failing — verify spoke model is ready and SA token works.
+**Expected**: 2 proxy pods `2/2 Running` (proxy + metrics sidecar), 2 endpoints. If `1/2`, the inference proxy readiness failed (upstream-health). If `0/2`, both containers failed.
 
-> **Key difference from 0.1**: Proxy uses `Host: <NLB-hostname>` and `Authorization: Bearer <SA-token>` instead of `Host: maas.apps.spoke1...` and `Bearer sk-oai-...`. The NLB hostname is the `openshift-ai-inference` gateway address, not the MaaS gateway.
+> **Key differences from 0.1**:
+> - Proxy uses `Host: <NLB-hostname>` and `Authorization: Bearer <SA-token>` (not MaaS key)
+> - Each proxy pod has 2 containers: `proxy` (inference:8080) + `metrics` (TLS:8081)
+> - nginx does NOT handle `/metrics` — the sidecar serves it over TLS with cert-manager cert
+> - Hub EPP scrapes `https://<pod-ip>:8081/metrics` (not `http://<pod-ip>:8080/metrics`)
 
 ### 2.2 Create ExternalModel + MaaS governance (same as 0.1)
 
@@ -797,9 +923,9 @@ spec:
             - --metrics-endpoint-auth=false
             - --health-checking=true
             - --refresh-metrics-interval=5s
-            - --model-server-metrics-port=8080
+            - --model-server-metrics-port=8081
             - --model-server-metrics-path=/metrics
-            - --model-server-metrics-scheme=http
+            - --model-server-metrics-scheme=https
             - --metrics-staleness-threshold=30s
           env:
             - name: POD_NAME
@@ -1009,6 +1135,8 @@ oc config use-context "default/api-osacmaas-kni-syseng-devcluster-openshift-com:
 | **Simplified spokes** | 3 operators instead of 10. No Kuadrant, no Authorino, no MaaS API keys, no pass-through CRs |
 | **Unified API key** | Single hub API key. No spoke API key management needed |
 | **K8s SA token auth** | Standard K8s mechanism. 720h token duration, RBAC-scoped |
+| **Decoupled metrics** | Dedicated TLS sidecar (port 8081) serves metrics — nginx NOT in metrics flow. cert-manager cert, no InsecureSkipVerify |
+| **Hub EPP scrapes via HTTPS** | `--model-server-metrics-scheme=https --model-server-metrics-port=8081`. Foundation for full mTLS |
 
 ## Key Design Decisions (vs 0.1)
 
@@ -1017,5 +1145,6 @@ oc config use-context "default/api-osacmaas-kni-syseng-devcluster-openshift-com:
 | `openshift-ai-inference` on spokes | Removes 7 operators. K8s RBAC is sufficient for hub proxy auth |
 | K8s SA token (720h) | Long-lived, RBAC-scoped. No MaaS API key management on spokes |
 | SA `view` ClusterRole | Minimal permission for inference access. Not cluster-admin |
-| Same proxy pattern | nginx + upstream health + metrics Route. Only credential type changes |
+| Proxy + metrics sidecar | nginx handles inference + health (8080). Dedicated sidecar handles metrics over TLS (8081). Decoupled per hexfusion feedback |
+| cert-manager TLS for metrics | OpenShift service-ca auto-generates cert via `serving-cert-secret-name` annotation. Same pattern as Authorino TLS. No InsecureSkipVerify |
 | Same Hub EPP config | spoke-epp engine, session-affinity, max-score-picker — gateway-independent |
