@@ -1019,11 +1019,3 @@ oc config use-context "default/api-osacmaas-kni-syseng-devcluster-openshift-com:
 | SA `view` ClusterRole | Minimal permission for inference access. Not cluster-admin |
 | Same proxy pattern | nginx + upstream health + metrics Route. Only credential type changes |
 | Same Hub EPP config | spoke-epp engine, session-affinity, max-score-picker — gateway-independent |
-
-## References
-
-- [Release 0.1 Guide](maas-spoke-hub-guide.md) — Full MaaS on all clusters
-- [Architecture Reference](spoke-hub-architecture.md) — Component inventory, failure modes
-- [Flow Diagrams](spoke-hub-flows.md) — Step-by-step request/response/failover flows
-- [Path C Setup](../phase3/external_model_openshift-ai-inference_setup.md) — Original Path C validation
-- [Requirements Roadmap](requirements/mc-llmd-gw-maas-requirements.md) — Release 0.1→0.5 plan
