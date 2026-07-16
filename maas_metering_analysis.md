@@ -1,5 +1,7 @@
 # [WIP] MaaS Metering Analysis
 
+> **Scope clarification**: The MaaS on OSAC team's deliverable is **usage/token metering** — emitting per-request token consumption metrics via the IPP external-metering plugin (CloudEvents). Infrastructure and capacity metrics (GPU utilization, node resources, cluster-level cost attribution) referenced in this document are included for **informational context only**. Capacity-based metering and billing are under the purview of the OSAC platform / CaaS team and are being planned separately within that workstream. This analysis does not prescribe the architecture or implementation for capacity-based metrics; it only documents where they originate to avoid confusion about ownership boundaries.
+
 *Technical analysis of token metering, tenant attribution, and infrastructure metrics for the OSAC MaaS platform. Covers metrics inventory, data flow, upstream PR status, and phased implementation.*
 
 ---
