@@ -608,7 +608,8 @@ spec:
     spec:
       containers:
         - name: proxy
-          image: nginxinc/nginx-unprivileged:1.27-alpine
+          image: registry.access.redhat.com/ubi9/nginx-124:latest
+          command: ["nginx", "-g", "daemon off;"]
           ports:
             - containerPort: 8080
           volumeMounts:
@@ -629,7 +630,8 @@ spec:
               port: 8080
             periodSeconds: 10
         - name: metrics
-          image: nginxinc/nginx-unprivileged:1.27-alpine
+          image: registry.access.redhat.com/ubi9/nginx-124:latest
+          command: ["nginx", "-g", "daemon off;"]
           ports:
             - containerPort: 8081
           volumeMounts:
@@ -672,7 +674,8 @@ spec:
     spec:
       containers:
         - name: proxy
-          image: nginxinc/nginx-unprivileged:1.27-alpine
+          image: registry.access.redhat.com/ubi9/nginx-124:latest
+          command: ["nginx", "-g", "daemon off;"]
           ports:
             - containerPort: 8080
           volumeMounts:
@@ -693,7 +696,8 @@ spec:
               port: 8080
             periodSeconds: 10
         - name: metrics
-          image: nginxinc/nginx-unprivileged:1.27-alpine
+          image: registry.access.redhat.com/ubi9/nginx-124:latest
+          command: ["nginx", "-g", "daemon off;"]
           ports:
             - containerPort: 8081
           volumeMounts:
